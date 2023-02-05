@@ -44,5 +44,6 @@ def test_torch(dtype):
 # test_torch(torch.float32)
 #test_torch(torch.float16)
 
-import tops
-tops.benchmark(MultiHeadSelfAtten(), (torch.rand(1, 32, 512), torch.rand(1, 32, 32)), verbose=True, logdir="./logs/multi-atten-1")
+if __name__ == "__main__":
+    import tops
+    tops.benchmark(MultiHeadSelfAtten(), (torch.rand(1, 32, 512), torch.rand(1, 32, 32)), verbose=True, logdir="./logs/multi-atten-1")
