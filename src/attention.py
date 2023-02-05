@@ -28,9 +28,8 @@ def test_torch(dtype):
     with torch.autocast('cuda', dtype):
         m.to('cuda:1')
         _ = m(torch.rand(1, 32, 512).to('cuda:1'), torch.rand(1, 32, 32).to('cuda:1'))
-# test_torch(torch.float32)
-#test_torch(torch.float16)
 
 if __name__ == "__main__":
+    test_torch(torch.float32)
     import tops
     tops.benchmark(SelfAtten(), (torch.rand(1, 32, 512), torch.rand(1, 32, 32)), verbose=True, logdir="./logs/self-atten-1")
