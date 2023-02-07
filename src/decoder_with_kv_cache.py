@@ -19,7 +19,9 @@ class MultiHeadSelfAtten(nn.Module):
         # k, v: [B, H, S, D/H]
         # out: [B, H, S, D/H] or [B, H, 1, D/H]
         score = torch.matmul(q, k.transpose(-2, -1)) / (self.dim ** 0.5) 
-        score = score.masked_fill(mask == 0, -1e3)
+        # mask could be None, means every token can be attended
+        if mask is not None:
+            score = score.masked_fill(mask == 0, -1e3)
         attn = score.softmax(dim=-1)
         out = torch.matmul(attn, v)
         return out
@@ -51,13 +53,15 @@ class MultiHeadSelfAtten(nn.Module):
 
 class DecoderLayer(nn.Module):
 
-    def __init__(self, dim = 512, head = 8) -> None:
+    def __init__(self, dim = 512, head = 8, dim_ff=None) -> None:
         super().__init__()
         self.attn = MultiHeadSelfAtten(dim, head)
         self.norm = nn.LayerNorm(dim)
-        self.mlp_linear1 = nn.Linear(dim, dim*4)
+        if dim_ff is None:
+            dim_ff = dim * 4
+        self.mlp_linear1 = nn.Linear(dim, dim_ff)
         self.act= nn.GELU()
-        self.mlp_linear2 = nn.Linear(dim*4, dim)
+        self.mlp_linear2 = nn.Linear(dim_ff, dim)
 
     def forward(self, x, mask, past_keys=None, past_values=None):
         # x: [B, S, D]
