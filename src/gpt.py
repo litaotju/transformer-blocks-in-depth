@@ -25,8 +25,7 @@ class MultiHeadSelfAtten(nn.Module):
         # k, v: [B, H, S, D/H]
         # out: [B, H, S, D/H] or [B, H, 1, D/H]
         score = torch.matmul(q, k.transpose(-2, -1)) / (math.sqrt(self.dim)) 
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -1e3)
+        score = score.masked_fill(mask == 0, -1e3)
         attn = score.softmax(dim=-1)
         out = torch.matmul(attn, v)
         return out
@@ -63,6 +62,7 @@ class DecoderLayer(nn.Module):
         self.attn = MultiHeadSelfAtten(dim, head)
         self.norm1 = nn.LayerNorm(dim)
 
+        # MLP
         self.norm2 = nn.LayerNorm(dim)
         self.mlp_linear1 = nn.Linear(dim, dim_ff)
         self.act= nn.GELU()
@@ -100,12 +100,14 @@ class GPT(nn.Module):
         self.decoders = nn.ModuleList([DecoderLayer(config.d_model, config.n_heads, config.d_ff) for _ in range(config.n_layers)])
         self.ln = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        self.register_buffer("mask", 
+            torch.tril(torch.ones(config.max_seq_len, config.max_seq_len)).view(1, 1, config.max_seq_len, config.max_seq_len))
     
-    def forward(self, idx, mask, past_keys: List[torch.Tensor], past_values: List[torch.Tensor]):
+    def forward(self, idx:torch.Tensor, past_keys: torch.Tensor, past_values: torch.Tensor):
         '''
         input shapes:
             idx: [B, S]
-            mask: [B, S, S]
             past_keys: [B, H, S, D/H]
             past_values: [B, H, S, D/H]
         output shapes:
@@ -116,6 +118,11 @@ class GPT(nn.Module):
         keys = []
         values = []
 
+        # In the first step, past_keys and past_values are None, idx is [B, length of prompt]
+        # And in the following steps, past_keys and past_values are not None, idx is [B, 1]
+
+        ## TODO: how to avoid this if-else such that only one onnx is needed for both
+        ## context stage, and generation stage?
         if past_keys is None:
             pos = torch.arange(idx.shape[1], dtype=torch.long).to(idx.device)
         else:
@@ -126,6 +133,10 @@ class GPT(nn.Module):
         x = self.word_embedding(idx)
         x += self.pos_embedding(pos).unsqueeze(0)
 
+        T_end = idx.size(1) + (past_keys[0].size(-2) if past_keys is not None else 0)
+        T_start = T_end - idx.size(1)
+        mask = self.mask[:, :, T_start:T_end, :T_end]
+
         for i, decoder in enumerate(self.decoders):
             if past_keys is not None:
                 x, current_key, current_value = decoder(x, mask, past_keys[i], past_values[i])
@@ -133,9 +144,13 @@ class GPT(nn.Module):
                 x, current_key, current_value = decoder(x, mask, None, None)
             keys.append(current_key)
             values.append(current_value)
+
         x = self.ln(x)
         # only last token is used for prediction
         logits = self.lm_head(x[:, -1:, :])
+
+        keys = torch.stack(keys) 
+        values = torch.stack(values)
         return logits, keys, values
 
     def generate(self, prompt):
@@ -146,34 +161,56 @@ class GPT(nn.Module):
 
         generated = []
         for i in range(iteration):
-            # TODO: why the mask is [1, 1, 1, seq] here
-            # can the generation stage take no mask?
-            # since it's auto regressive, the current token should attend to all previous tokens
-            # seq = 32 + i + 1
-            # mask = torch.ones(1, 1, 1, seq).to('cuda:1')
-            mask = None
-            logits, keys, values = self(x, mask, keys, values)
+            logits, keys, values = self(x, keys, values)
+
+            # only last token is used for prediction
             logits = logits[:, -1:, :]
             probs = F.softmax(logits, dim=-1)
+
             # sample from the distribution
             x = torch.multinomial(probs[:,-1,:], num_samples=1)
             generated.append(x)
         return torch.cat(generated, dim=1)
 
 configs = {
+    'tiny' : GPTConfig(vocab_size=50257, n_layers=1, n_heads=2, d_model=768, d_ff=3072, dropout=0.1, max_seq_len=2048),
     'small' : GPTConfig(vocab_size=50257, n_layers=12, n_heads=12, d_model=768, d_ff=3072, dropout=0.1, max_seq_len=2048),
     'gpt3' :GPTConfig(vocab_size=50257, n_layers=96, n_heads=96, d_model=12288, d_ff=49152, dropout=0.1, max_seq_len=2048)
 }
 
-if __name__ == "__main__":
-    config_name = sys.argv[1] if len(sys.argv) > 1 else 'small'
-    device = 'cuda:1'
+def export_model(config: GPTConfig, model_path: str, device: str):
+    bs = 8
+    context_len = 32
+    past_shape = (config.n_layers, bs, config.n_heads, context_len, config.d_model//config.n_heads)
+    past_keys = torch.randn(past_shape).to(device)
+    past_values = torch.randn(past_shape).to(device)
+    idx = torch.randint(config.vocab_size, [bs, 1]).to(device)
 
-    config = configs[config_name]
+    torch.onnx.export(
+        GPT(config).to(device),
+        (idx, past_keys, past_values),
+        model_path,
+        input_names=['idx', 'past_keys', 'past_values'],
+        output_names=['logits', 'past_keys', 'past_values'],
+        dynamic_axes={
+            'idx': {0: 'batch_size', 1: 'seq_len'},
+            'past_keys': {1: 'batch_size', 3: 'seq_len'},
+            'past_values': {1: 'batch_size', 3: 'seq_len'},
+        },
+        verbose=True,
+    )
+
+def test_inference(config: GPTConfig):
     gpt_small = GPT(config).to(device)
-
     bs = 8
     context_len = 32
     prompt =  torch.randint(config.vocab_size, [bs, context_len]).to(device)
     generated = gpt_small.generate(prompt)
     print("generated shape:", generated.shape)
+
+if __name__ == "__main__":
+    config_name = sys.argv[1] if len(sys.argv) > 1 else 'small'
+    device = 'cuda:1'
+    config = configs[config_name]
+    # test_inference(config)
+    export_model(config, f'gpt_{config_name}.onnx', device)
