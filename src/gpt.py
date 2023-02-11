@@ -25,7 +25,11 @@ class MultiHeadSelfAtten(nn.Module):
         # k, v: [B, H, S, D/H]
         # out: [B, H, S, D/H] or [B, H, 1, D/H]
         score = torch.matmul(q, k.transpose(-2, -1)) / (math.sqrt(self.dim)) 
+
+        # Equal to 
+        # score = torch.where(mask, score, -1e3)
         score = score.masked_fill(mask == 0, -1e3)
+
         attn = score.softmax(dim=-1)
         out = torch.matmul(attn, v)
         return out
@@ -55,7 +59,7 @@ class MultiHeadSelfAtten(nn.Module):
         return out, k, v
 
 
-class DecoderLayer(nn.Module):
+class DecoderBlock(nn.Module):
 
     def __init__(self, dim, head, dim_ff) -> None:
         super().__init__()
@@ -97,7 +101,7 @@ class GPT(nn.Module):
         super().__init__()
         self.word_embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_embedding = nn.Embedding(config.max_seq_len, config.d_model)
-        self.decoders = nn.ModuleList([DecoderLayer(config.d_model, config.n_heads, config.d_ff) for _ in range(config.n_layers)])
+        self.decoders = nn.ModuleList([DecoderBlock(config.d_model, config.n_heads, config.d_ff) for _ in range(config.n_layers)])
         self.ln = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
@@ -173,9 +177,17 @@ class GPT(nn.Module):
         return torch.cat(generated, dim=1)
 
 configs = {
+    #Just for quick test
     'tiny' : GPTConfig(vocab_size=50257, n_layers=1, n_heads=2, d_model=768, d_ff=3072, dropout=0.1, max_seq_len=2048),
+    # model configs from the original GPT-3 paper
     'small' : GPTConfig(vocab_size=50257, n_layers=12, n_heads=12, d_model=768, d_ff=3072, dropout=0.1, max_seq_len=2048),
-    'gpt3' :GPTConfig(vocab_size=50257, n_layers=96, n_heads=96, d_model=12288, d_ff=49152, dropout=0.1, max_seq_len=2048)
+    'medium' : GPTConfig(vocab_size=50257, n_layers=24, n_heads=16, d_model=1024, d_ff=4096, dropout=0.1, max_seq_len=2048),
+    'large' : GPTConfig(vocab_size=50257, n_layers=24, n_heads=16, d_model=1536, d_ff=1536*4, dropout=0.1, max_seq_len=2048),
+    'xl' : GPTConfig(vocab_size=50257, n_layers=24, n_heads=24, d_model=2048, d_ff=2048*4, dropout=0.1, max_seq_len=2048),
+    '2.7B' : GPTConfig(vocab_size=50257, n_layers=32, n_heads=32, d_model=2560, d_ff=2560*4, dropout=0.1, max_seq_len=2048),
+    '6.7B': GPTConfig(vocab_size=50257, n_layers=32, n_heads=32, d_model=4096, d_ff=4096*4, dropout=0.1, max_seq_len=2048),
+    '13B': GPTConfig(vocab_size=50257, n_layers=40, n_heads=40, d_model=5140, d_ff=5140*4, dropout=0.1, max_seq_len=2048),
+    '175B' :GPTConfig(vocab_size=50257, n_layers=96, n_heads=96, d_model=12288, d_ff=49152, dropout=0.1, max_seq_len=2048)
 }
 
 def export_model(config: GPTConfig, model_path: str, device: str):
@@ -186,8 +198,9 @@ def export_model(config: GPTConfig, model_path: str, device: str):
     past_values = torch.randn(past_shape).to(device)
     idx = torch.randint(config.vocab_size, [bs, 1]).to(device)
 
+    gpt = GPT(config).to(device)
     torch.onnx.export(
-        GPT(config).to(device),
+        gpt,
         (idx, past_keys, past_values),
         model_path,
         input_names=['idx', 'past_keys', 'past_values'],
@@ -200,6 +213,27 @@ def export_model(config: GPTConfig, model_path: str, device: str):
         verbose=True,
     )
 
+def test_tops(config: GPTConfig):
+    bs = 8
+    context_len = 32
+    past_shape = (config.n_layers, bs, config.n_heads, context_len, config.d_model//config.n_heads)
+    past_keys = torch.randn(past_shape).to(device)
+    past_values = torch.randn(past_shape).to(device)
+    idx = torch.randint(config.vocab_size, [bs, 1]).to(device)
+
+    gpt = GPT(config).to(device)
+ 
+    import tops
+    tops.benchmark(gpt, (idx, past_keys, past_values), 1, verbose=True, logdir="./logs/gpt",
+        input_names=['idx', 'past_keys', 'past_values'],
+        output_names=['logits', 'past_keys', 'past_values'],
+        dynamic_axes={
+            'idx': {0: 'batch_size', 1: 'seq_len'},
+            'past_keys': {1: 'batch_size', 3: 'seq_len'},
+            'past_values': {1: 'batch_size', 3: 'seq_len'},
+        },
+    )
+
 def test_inference(config: GPTConfig):
     gpt_small = GPT(config).to(device)
     bs = 8
@@ -209,8 +243,10 @@ def test_inference(config: GPTConfig):
     print("generated shape:", generated.shape)
 
 if __name__ == "__main__":
-    config_name = sys.argv[1] if len(sys.argv) > 1 else 'small'
+    config_name = sys.argv[1] if len(sys.argv) > 1 else 'tiny'
     device = 'cuda:1'
     config = configs[config_name]
+    print(config)
+
     # test_inference(config)
     export_model(config, f'gpt_{config_name}.onnx', device)
